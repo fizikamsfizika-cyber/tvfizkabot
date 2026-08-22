@@ -15,6 +15,7 @@ const APP_URL = process.env.APP_URL;       // masalan: https://tvfizika-bot.onre
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI; // MongoDB Atlas connection string
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'; // masalan: https://tvfizika.uz
+const APP_SITE_URL = process.env.APP_SITE_URL || null; // masalan: https://tvfizika.uz (foydalanuvchiga xabar ichida ko'rsatiladigan link)
 
 if (!BOT_TOKEN) {
   console.error('XATOLIK: BOT_TOKEN environment variable topilmadi!');
@@ -49,11 +50,41 @@ const userSchema = new mongoose.Schema({
   loginCode: { type: String, default: null, index: true },
   codeCreatedAt: { type: Number, default: null },
   createdAt: { type: Number, default: () => Date.now() },
+  lastLoginAt: { type: Number, default: null },
 });
 
 const User = mongoose.model('User', userSchema);
 
-// 6 xonali tasodifiy login kod generatsiya qilish
+// ---------- DARSLAR (Lessons) ----------
+const lessonSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  content: { type: String, default: '' },
+  order: { type: Number, required: true, index: true },
+  createdAt: { type: Number, default: () => Date.now() },
+});
+const Lesson = mongoose.model('Lesson', lessonSchema);
+
+// Admin chatId'lari — vergul bilan ajratilgan holda .env ga qo'shiladi: ADMIN_IDS=123456,789012
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map(Number);
+
+function isAdmin(chatId) {
+  return ADMIN_IDS.includes(chatId);
+}
+
+// Bot API 9.4: tugmalarga rang berish uchun yordamchi funksiya
+// style: "primary" (ko'k), "success" (yashil), "danger" (qizil)
+function styledCallback(text, callback_data, style) {
+  return { text, callback_data, style };
+}
+function styledUrl(text, url, style) {
+  return { text, url, style };
+}
+
+
 function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
@@ -94,7 +125,16 @@ bot.start(async (ctx) => {
         `Saytga kirish uchun quyidagi kodni kiriting:\n\n` +
         `🔑 *${code}*\n\n` +
         `Kod 10 daqiqa amal qiladi.`,
-        { parse_mode: 'Markdown' }
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [styledCallback('🔄 Yangi kod olish', 'NEW_CODE', 'primary')],
+              [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
+              [styledCallback('👤 Profilim', 'PROFILE', 'success'), styledCallback('ℹ️ Yordam', 'HELP', 'danger')],
+            ],
+          },
+        }
       );
     }
 
@@ -111,14 +151,41 @@ bot.start(async (ctx) => {
   }
 });
 
-bot.on('text', (ctx) => {
+bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
+  const text = ctx.message.text.trim();
+
+  // Admin: dars qo'shish jarayoni
+  const adminSession = adminSessions[chatId];
+  if (adminSession) {
+    if (adminSession.step === 'title') {
+      adminSession.title = text;
+      adminSession.step = 'content';
+      return ctx.reply("Endi dars matnini (tavsifini) kiriting:");
+    }
+    if (adminSession.step === 'content') {
+      try {
+        const count = await Lesson.countDocuments();
+        await Lesson.create({
+          title: adminSession.title,
+          content: text,
+          order: count,
+        });
+        delete adminSessions[chatId];
+        return ctx.reply("✅ Dars muvaffaqiyatli qo'shildi! /darslar orqali ko'rishingiz mumkin.");
+      } catch (e) {
+        console.error('dars_qoshish xatoligi:', e.message);
+        delete adminSessions[chatId];
+        return ctx.reply("Xatolik yuz berdi, dars saqlanmadi.");
+      }
+    }
+    return;
+  }
+
   const session = sessions[chatId];
   if (!session) {
     return ctx.reply("Boshlash uchun /start buyrug'ini yuboring.");
   }
-
-  const text = ctx.message.text.trim();
 
   if (session.step === 'ism') {
     if (text.length < 3) {
@@ -168,17 +235,172 @@ bot.on('contact', async (ctx) => {
     await newUser.save();
     delete sessions[chatId];
 
+    await ctx.reply(
+      `Ro'yxatdan muvaffaqiyatli o'tdingiz, ${session.ism}! ✅`,
+      { ...Markup.removeKeyboard() }
+    );
+
     return ctx.reply(
-      `Ro'yxatdan muvaffaqiyatli o'tdingiz, ${session.ism}! ✅\n\n` +
       `Saytga kirish uchun quyidagi kodni kiriting:\n\n` +
       `🔑 *${code}*\n\n` +
       `Kod 10 daqiqa amal qiladi. Yangi kod olish uchun istalgan vaqt /start yuboring.`,
-      { parse_mode: 'Markdown', ...Markup.removeKeyboard() }
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [styledCallback('🔄 Yangi kod olish', 'NEW_CODE', 'primary')],
+            [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
+            [styledCallback('👤 Profilim', 'PROFILE', 'success'), styledCallback('ℹ️ Yordam', 'HELP', 'danger')],
+          ],
+        },
+      }
     );
   } catch (e) {
     console.error('contact xatoligi:', e.message);
     return ctx.reply("Kechirasiz, ro'yxatdan o'tishda xatolik yuz berdi. Qaytadan /start bosing.");
   }
+});
+
+// ---------- INLINE TUGMALAR (callback query'lar) ----------
+
+bot.action('NEW_CODE', async (ctx) => {
+  await ctx.answerCbQuery('Yangi kod yaratilmoqda...');
+  const chatId = ctx.chat.id;
+  try {
+    const user = await User.findOne({ chatId });
+    if (!user) return ctx.reply("Siz hali ro'yxatdan o'tmagansiz. /start ni bosing.");
+
+    const code = await generateUniqueCode();
+    user.loginCode = code;
+    user.codeCreatedAt = Date.now();
+    await user.save();
+
+    return ctx.reply(
+      `🔑 Yangi kodingiz: *${code}*\n\nKod 10 daqiqa amal qiladi.`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    console.error('NEW_CODE xatoligi:', e.message);
+    return ctx.reply('Xatolik yuz berdi, birozdan so\'ng qayta urinib ko\'ring.');
+  }
+});
+
+bot.action('PROFILE', async (ctx) => {
+  await ctx.answerCbQuery();
+  const chatId = ctx.chat.id;
+  try {
+    const user = await User.findOne({ chatId });
+    if (!user) return ctx.reply("Siz hali ro'yxatdan o'tmagansiz. /start ni bosing.");
+
+    return ctx.reply(
+      `👤 *Profil ma'lumotlari*\n\n` +
+      `Ism: ${user.ism}\n` +
+      `Telefon: ${user.telefon}\n` +
+      `Ro'yxatdan o'tgan sana: ${new Date(user.createdAt).toLocaleDateString('uz-UZ')}\n` +
+      (user.lastLoginAt ? `Oxirgi kirish: ${new Date(user.lastLoginAt).toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent' })}\n` : ''),
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    console.error('PROFILE xatoligi:', e.message);
+    return ctx.reply('Xatolik yuz berdi.');
+  }
+});
+
+bot.action('OPEN_LESSONS', async (ctx) => {
+  await ctx.answerCbQuery();
+  const { total, index, lesson } = await getLessonByIndex(0);
+  if (!lesson) return ctx.reply("Hozircha darslar qo'shilmagan.");
+  return ctx.reply(formatLessonText(lesson, index, total), {
+    parse_mode: 'Markdown',
+    reply_markup: lessonsKeyboard(index, total),
+  });
+});
+
+bot.action('HELP', async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    'ℹ️ *Yordam*\n\n' +
+    '/start — ro\'yxatdan o\'tish yoki yangi kirish kodi olish\n' +
+    '/darslar — darslar ro\'yxatini ko\'rish\n\n' +
+    'Kodni saytdagi kirish oynasiga kiriting. Kod 10 daqiqa amal qiladi.\n' +
+    'Savollar bo\'lsa: @tvfizika_support',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ---------- KO'P SAHIFALI NAVIGATSIYA (rangli Oldingisi/Keyingisi, MongoDB'dan) ----------
+
+async function getLessonByIndex(index) {
+  const total = await Lesson.countDocuments();
+  if (total === 0) return { total: 0, index: 0, lesson: null };
+  const safeIndex = Math.max(0, Math.min(index, total - 1));
+  const lesson = await Lesson.findOne().sort({ order: 1 }).skip(safeIndex);
+  return { total, index: safeIndex, lesson };
+}
+
+function lessonsKeyboard(index, total) {
+  const navRow = [];
+  if (index > 0) {
+    navRow.push(styledCallback('⬅️ Oldingisi', `LESSON_${index - 1}`, 'primary'));
+  }
+  if (index < total - 1) {
+    navRow.push(styledCallback('Keyingisi ➡️', `LESSON_${index + 1}`, 'primary'));
+  }
+  const rows = [];
+  if (navRow.length) rows.push(navRow);
+  return { inline_keyboard: rows };
+}
+
+function formatLessonText(lesson, index, total) {
+  return (
+    `📘 *${lesson.title}*\n` +
+    `_(${index + 1}/${total})_\n\n` +
+    (lesson.content ? lesson.content : '_Matn hali qo\'shilmagan._')
+  );
+}
+
+bot.action(/LESSON_(\d+)/, async (ctx) => {
+  const requestedIndex = parseInt(ctx.match[1], 10);
+  await ctx.answerCbQuery();
+  const { total, index, lesson } = await getLessonByIndex(requestedIndex);
+  if (!lesson) return ctx.reply('Hozircha darslar mavjud emas.');
+  return ctx.editMessageText(formatLessonText(lesson, index, total), {
+    parse_mode: 'Markdown',
+    reply_markup: lessonsKeyboard(index, total),
+  });
+});
+
+bot.command('darslar', async (ctx) => {
+  const { total, index, lesson } = await getLessonByIndex(0);
+  if (!lesson) {
+    return ctx.reply(
+      "Hozircha darslar qo'shilmagan." +
+      (isAdmin(ctx.chat.id) ? "\n\n/dars_qoshish buyrug'i orqali dars qo'shishingiz mumkin." : '')
+    );
+  }
+  return ctx.reply(formatLessonText(lesson, index, total), {
+    parse_mode: 'Markdown',
+    reply_markup: lessonsKeyboard(index, total),
+  });
+});
+
+// ---------- ADMIN: DARS QO'SHISH ----------
+// step: 'title' -> 'content' -> saqlash
+const adminSessions = {};
+
+bot.command('dars_qoshish', (ctx) => {
+  const chatId = ctx.chat.id;
+  if (!isAdmin(chatId)) return ctx.reply("Bu buyruq faqat adminlar uchun.");
+  adminSessions[chatId] = { step: 'title' };
+  return ctx.reply("Yangi dars sarlavhasini kiriting (masalan: '4-dars: Termodinamika'):");
+});
+
+bot.command('darslar_royxati', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return ctx.reply("Bu buyruq faqat adminlar uchun.");
+  const all = await Lesson.find().sort({ order: 1 });
+  if (!all.length) return ctx.reply("Darslar ro'yxati bo'sh.");
+  const text = all.map((l, i) => `${i + 1}. ${l.title}`).join('\n');
+  return ctx.reply(`📚 Darslar ro'yxati:\n\n${text}`);
 });
 
 // ---------- WEBHOOK O'RNATISH (Render uchun) ----------
@@ -212,7 +434,31 @@ app.post('/api/verify', verifyLimiter, async (req, res) => {
     }
 
     user.loginCode = null;
+    user.lastLoginAt = Date.now();
     await user.save();
+
+    // Foydalanuvchiga saytga kirgani haqida Telegram orqali xabar yuborish
+    try {
+      await bot.telegram.sendMessage(
+        user.chatId,
+        `✅ *Muvaffaqiyatli kirish!*\n\n` +
+        `Siz *Tv Fizika* veb-saytiga muvaffaqiyatli kirdingiz.\n` +
+        `🕒 Vaqt: ${new Date().toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent' })}\n\n` +
+        `Agar bu siz bo'lmasangiz, darhol biz bilan bog'laning.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [styledUrl('🌐 Saytga o\'tish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+              [styledCallback('👤 Profilim', 'PROFILE', 'success')],
+            ],
+          },
+        }
+      );
+    } catch (notifyErr) {
+      // Xabar yuborilmasa ham login jarayoni davom etadi
+      console.error('Login xabarini yuborishda xatolik:', notifyErr.message);
+    }
 
     return res.json({
       ok: true,
