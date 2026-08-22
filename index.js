@@ -16,6 +16,7 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI; // MongoDB Atlas connection string
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'; // masalan: https://tvfizika.uz
 const APP_SITE_URL = process.env.APP_SITE_URL || null; // masalan: https://tvfizika.uz (foydalanuvchiga xabar ichida ko'rsatiladigan link)
+const BOT_USERNAME = process.env.BOT_USERNAME || null; // masalan: TvFizikaBot (@ belgisiz, saytdagi tugma/QR uchun kerak)
 
 if (!BOT_TOKEN) {
   console.error('XATOLIK: BOT_TOKEN environment variable topilmadi!');
@@ -46,14 +47,34 @@ const userSchema = new mongoose.Schema({
   chatId: { type: Number, required: true, index: true },
   ism: { type: String, required: true },
   telefon: { type: String, required: true },
+  viloyat: { type: String, default: null },
+  tuman: { type: String, default: null },
   telegramUsername: { type: String, default: null },
   loginCode: { type: String, default: null, index: true },
   codeCreatedAt: { type: Number, default: null },
   createdAt: { type: Number, default: () => Date.now() },
   lastLoginAt: { type: Number, default: null },
+  isLoggedIn: { type: Boolean, default: false },
 });
 
 const User = mongoose.model('User', userSchema);
+
+// ---------- AVTOMATIK LOGIN TOKENLARI (sayt <-> bot) ----------
+// Foydalanuvchi saytdagi "Telegram bot orqali kirish" tugmasini bosganda
+// noyob token generatsiya qilinadi. Bot orqali /start?token bosilganda
+// shu token foydalanuvchi bilan bog'lanadi va sayt buni kutib (polling) turadi.
+const loginTokenSchema = new mongoose.Schema({
+  token: { type: String, required: true, unique: true, index: true },
+  status: { type: String, enum: ['pending', 'confirmed', 'expired'], default: 'pending' },
+  chatId: { type: Number, default: null },
+  userId: { type: String, default: null },
+  createdAt: { type: Number, default: () => Date.now() },
+});
+const LoginToken = mongoose.model('LoginToken', loginTokenSchema);
+
+function generateLoginToken() {
+  return 'lt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+}
 
 // ---------- DARSLAR (Lessons) ----------
 const lessonSchema = new mongoose.Schema({
@@ -110,27 +131,70 @@ const sessions = {};
 
 bot.start(async (ctx) => {
   const chatId = ctx.chat.id;
+  const payload = (ctx.startPayload || '').trim(); // masalan: lt_xxxxx (sayt orqali kelgan login token)
+  const loginToken = payload.startsWith('lt_') ? payload : null;
 
   try {
     const existing = await User.findOne({ chatId });
 
     if (existing) {
-      const code = await generateUniqueCode();
-      existing.loginCode = code;
-      existing.codeCreatedAt = Date.now();
-      await existing.save();
+      // Agar foydalanuvchi saytdagi tugma orqali (token bilan) kelgan bo'lsa —
+      // avtomatik login qilamiz, hech qanday kod so'ralmaydi.
+      if (loginToken) {
+        const tokenDoc = await LoginToken.findOne({ token: loginToken, status: 'pending' });
+        if (tokenDoc) {
+          tokenDoc.status = 'confirmed';
+          tokenDoc.chatId = chatId;
+          tokenDoc.userId = existing.id;
+          await tokenDoc.save();
+
+          existing.isLoggedIn = true;
+          existing.lastLoginAt = Date.now();
+          await existing.save();
+
+          return ctx.reply(
+            `✅ Tabriklaymiz, ${existing.ism}!\n\n` +
+            `Siz *Tv Fizika* saytiga muvaffaqiyatli kirdingiz.\n` +
+            `Endi saytga qaytishingiz mumkin — u avtomatik yangilanadi.`,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [
+                  [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+                  [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
+                ],
+              },
+            }
+          );
+        }
+      }
+
+      if (existing.isLoggedIn) {
+        return ctx.reply(
+          `Xush kelibsiz qaytganingizdan xursandmiz, ${existing.ism}! 👋\n\n` +
+          `Siz allaqachon ro'yxatdan o'tgansiz va saytga kirgansiz.`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+                [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
+                [styledCallback('👤 Profilim', 'PROFILE', 'success'), styledCallback('ℹ️ Yordam', 'HELP', 'danger')],
+              ],
+            },
+          }
+        );
+      }
 
       return ctx.reply(
-        `Salom, ${existing.ism}! 👋\n\n` +
-        `Saytga kirish uchun quyidagi kodni kiriting:\n\n` +
-        `🔑 *${code}*\n\n` +
-        `Kod 10 daqiqa amal qiladi.`,
+        `Xush kelibsiz qaytganingizdan xursandmiz, ${existing.ism}! 👋\n\n` +
+        `Siz allaqachon ro'yxatdan o'tgansiz. Saytga kirish uchun quyidagi tugmani bosing:`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
-              [styledCallback('🔄 Yangi kod olish', 'NEW_CODE', 'primary')],
-              [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
+              [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+              [styledCallback('🔑 6 xonali kodni olish', 'NEW_CODE', 'primary')],
               [styledCallback('👤 Profilim', 'PROFILE', 'success'), styledCallback('ℹ️ Yordam', 'HELP', 'danger')],
             ],
           },
@@ -138,7 +202,7 @@ bot.start(async (ctx) => {
       );
     }
 
-    sessions[chatId] = { step: 'ism' };
+    sessions[chatId] = { step: 'ism', loginToken };
     return ctx.reply(
       "Assalomu alaykum! 👋\n\n" +
       "*Tv Fizika* saytiga xush kelibsiz.\n" +
@@ -204,6 +268,23 @@ bot.on('text', async (ctx) => {
   if (session.step === 'telefon') {
     return ctx.reply("Iltimos pastdagi tugma orqali telefon raqamingizni yuboring.");
   }
+
+  if (session.step === 'viloyat') {
+    if (text.length < 2) {
+      return ctx.reply("Iltimos, viloyat nomini kiriting.");
+    }
+    session.viloyat = text;
+    session.step = 'tuman';
+    return ctx.reply("Qaysi tumandasiz?");
+  }
+
+  if (session.step === 'tuman') {
+    if (text.length < 2) {
+      return ctx.reply("Iltimos, tuman nomini kiriting.");
+    }
+    session.tuman = text;
+    return finishRegistration(ctx, session);
+  }
 });
 
 bot.on('contact', async (ctx) => {
@@ -215,7 +296,17 @@ bot.on('contact', async (ctx) => {
     return ctx.reply("Iltimos, faqat o'zingizning telefon raqamingizni yuboring.");
   }
 
-  const phone = ctx.message.contact.phone_number;
+  session.telefon = ctx.message.contact.phone_number;
+  session.step = 'viloyat';
+
+  await ctx.reply("Rahmat! ✅", { ...Markup.removeKeyboard() });
+  return ctx.reply("Qaysi viloyatdasiz?");
+});
+
+// Ro'yxatdan o'tishni yakunlash: foydalanuvchini bazaga yozish, token bo'lsa avtomatik login,
+// bo'lmasa 6 xonali kod berish.
+async function finishRegistration(ctx, session) {
+  const chatId = ctx.chat.id;
 
   try {
     const userId = 'u_' + Date.now();
@@ -225,20 +316,50 @@ bot.on('contact', async (ctx) => {
       id: userId,
       chatId,
       ism: session.ism,
-      telefon: phone,
+      telefon: session.telefon,
+      viloyat: session.viloyat || null,
+      tuman: session.tuman || null,
       telegramUsername: ctx.from.username || null,
       loginCode: code,
       codeCreatedAt: Date.now(),
       createdAt: Date.now(),
     });
 
+    // Agar ro'yxatdan o'tish sayt orqali (token bilan) boshlangan bo'lsa —
+    // ro'yxatdan o'tish tugashi bilanoq avtomatik login qilamiz, kod kerak emas.
+    if (session.loginToken) {
+      const tokenDoc = await LoginToken.findOne({ token: session.loginToken, status: 'pending' });
+      if (tokenDoc) {
+        tokenDoc.status = 'confirmed';
+        tokenDoc.chatId = chatId;
+        tokenDoc.userId = userId;
+        await tokenDoc.save();
+
+        newUser.isLoggedIn = true;
+        newUser.lastLoginAt = Date.now();
+        newUser.loginCode = null;
+        await newUser.save();
+        delete sessions[chatId];
+
+        return ctx.reply(
+          `✅ Ro'yxatdan o'tish yakunlandi!`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+                [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
+              ],
+            },
+          }
+        );
+      }
+    }
+
     await newUser.save();
     delete sessions[chatId];
 
-    await ctx.reply(
-      `Ro'yxatdan muvaffaqiyatli o'tdingiz, ${session.ism}! ✅`,
-      { ...Markup.removeKeyboard() }
-    );
+    await ctx.reply(`✅ Ro'yxatdan o'tish yakunlandi!`, { parse_mode: 'Markdown' });
 
     return ctx.reply(
       `Saytga kirish uchun quyidagi kodni kiriting:\n\n` +
@@ -256,10 +377,11 @@ bot.on('contact', async (ctx) => {
       }
     );
   } catch (e) {
-    console.error('contact xatoligi:', e.message);
+    console.error('finishRegistration xatoligi:', e.message);
+    delete sessions[chatId];
     return ctx.reply("Kechirasiz, ro'yxatdan o'tishda xatolik yuz berdi. Qaytadan /start bosing.");
   }
-});
+}
 
 // ---------- INLINE TUGMALAR (callback query'lar) ----------
 
@@ -296,6 +418,9 @@ bot.action('PROFILE', async (ctx) => {
       `👤 *Profil ma'lumotlari*\n\n` +
       `Ism: ${user.ism}\n` +
       `Telefon: ${user.telefon}\n` +
+      (user.viloyat ? `Viloyat: ${user.viloyat}\n` : '') +
+      (user.tuman ? `Tuman: ${user.tuman}\n` : '') +
+      `Holat: ${user.isLoggedIn ? '✅ Tizimga kirgan' : '🚪 Tizimga kirmagan'}\n` +
       `Ro'yxatdan o'tgan sana: ${new Date(user.createdAt).toLocaleDateString('uz-UZ')}\n` +
       (user.lastLoginAt ? `Oxirgi kirish: ${new Date(user.lastLoginAt).toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent' })}\n` : ''),
       { parse_mode: 'Markdown' }
@@ -417,6 +542,64 @@ const verifyLimiter = rateLimit({
   message: { ok: false, error: "Juda ko'p urinish. Birozdan so'ng qayta urinib ko'ring." },
 });
 
+// ---------- AVTOMATIK LOGIN (token orqali, "Telegram bot orqali kirish" tugmasi uchun) ----------
+
+// 1) Sayt bu endpointni chaqirib token oladi, so'ng foydalanuvchini
+//    https://t.me/BOT_USERNAME?start=TOKEN manziliga yo'naltiradi (yoki QR sifatida ko'rsatadi).
+app.post('/api/login-token', async (req, res) => {
+  if (!BOT_USERNAME) {
+    return res.status(500).json({ ok: false, error: "BOT_USERNAME sozlanmagan" });
+  }
+  try {
+    const token = generateLoginToken();
+    await LoginToken.create({ token });
+    return res.json({
+      ok: true,
+      token,
+      deepLink: `https://t.me/${BOT_USERNAME}?start=${token}`,
+    });
+  } catch (e) {
+    console.error('login-token xatoligi:', e.message);
+    return res.status(500).json({ ok: false, error: "Server xatoligi" });
+  }
+});
+
+// 2) Sayt shu endpointni har 2 soniyada so'raydi (polling) — foydalanuvchi
+//    botda ro'yxatdan o'tishi/tasdiqlashi bilanoq "confirmed" qaytadi.
+app.get('/api/login-status/:token', async (req, res) => {
+  try {
+    const tokenDoc = await LoginToken.findOne({ token: req.params.token });
+    if (!tokenDoc) return res.status(404).json({ ok: false, error: "Token topilmadi" });
+
+    const FIFTEEN_MIN = 15 * 60 * 1000;
+    if (tokenDoc.status === 'pending' && Date.now() - tokenDoc.createdAt > FIFTEEN_MIN) {
+      tokenDoc.status = 'expired';
+      await tokenDoc.save();
+    }
+
+    if (tokenDoc.status !== 'confirmed') {
+      return res.json({ ok: true, status: tokenDoc.status });
+    }
+
+    const user = await User.findOne({ id: tokenDoc.userId });
+    if (!user) return res.json({ ok: true, status: 'pending' });
+
+    return res.json({
+      ok: true,
+      status: 'confirmed',
+      user: {
+        id: user.id,
+        ism: user.ism,
+        telefon: user.telefon,
+        telegramUsername: user.telegramUsername,
+      },
+    });
+  } catch (e) {
+    console.error('login-status xatoligi:', e.message);
+    return res.status(500).json({ ok: false, error: "Server xatoligi" });
+  }
+});
+
 app.post('/api/verify', verifyLimiter, async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ ok: false, error: "Kod kiritilmagan" });
@@ -435,6 +618,7 @@ app.post('/api/verify', verifyLimiter, async (req, res) => {
 
     user.loginCode = null;
     user.lastLoginAt = Date.now();
+    user.isLoggedIn = true;
     await user.save();
 
     // Foydalanuvchiga saytga kirgani haqida Telegram orqali xabar yuborish
@@ -477,6 +661,43 @@ app.post('/api/verify', verifyLimiter, async (req, res) => {
 
 app.get('/', (req, res) => {
   res.send('Tv Fizika Telegram bot ishlayapti ✅');
+});
+
+// Sayt tomonidan "Chiqish" bosilganda chaqiriladi — { userId: "u_..." } yuboriladi
+app.post('/api/logout', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ ok: false, error: "userId kiritilmagan" });
+
+  try {
+    const user = await User.findOne({ id: userId });
+    if (!user) return res.status(404).json({ ok: false, error: "Foydalanuvchi topilmadi" });
+
+    user.isLoggedIn = false;
+    await user.save();
+
+    try {
+      await bot.telegram.sendMessage(
+        user.chatId,
+        `🚪 Siz *Tv Fizika* saytidan tizimdan chiqdingiz.\n\n` +
+        `Qayta kirish uchun saytdagi *"Kirish"* tugmasini bosing va maxsus 6 xonali kodni oling.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [styledCallback('🔑 6 xonali kodni olish', 'NEW_CODE', 'primary')],
+            ],
+          },
+        }
+      );
+    } catch (notifyErr) {
+      console.error('Logout xabarini yuborishda xatolik:', notifyErr.message);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('logout xatoligi:', e.message);
+    return res.status(500).json({ ok: false, error: "Server xatoligi" });
+  }
 });
 
 // ---------- SERVERNI ISHGA TUSHIRISH ----------
