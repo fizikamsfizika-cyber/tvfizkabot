@@ -7,6 +7,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
 const { Telegraf, Markup } = require('telegraf');
 
 // ---------- SOZLAMALAR ----------
@@ -17,6 +18,7 @@ const MONGODB_URI = process.env.MONGODB_URI; // MongoDB Atlas connection string
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'; // masalan: https://tvfizika.uz
 const APP_SITE_URL = process.env.APP_SITE_URL || null; // masalan: https://tvfizika.uz (foydalanuvchiga xabar ichida ko'rsatiladigan link)
 const BOT_USERNAME = process.env.BOT_USERNAME || null; // masalan: TvFizikaBot (@ belgisiz, saytdagi tugma/QR uchun kerak)
+const JWT_SECRET = process.env.JWT_SECRET || 'tvfizika_dev_secret_almashtiring'; // Render'da albatta o'zingizniki bilan almashtiring!
 
 if (!BOT_TOKEN) {
   console.error('XATOLIK: BOT_TOKEN environment variable topilmadi!');
@@ -105,6 +107,20 @@ function styledUrl(text, url, style) {
   return { text, url, style };
 }
 
+// Foydalanuvchi uchun saytga avtomatik kirish tokeni (JWT) yaratadi.
+// Token 1 soat amal qiladi va faqat userId'ni o'zida saqlaydi (parol/kod emas).
+function generateSiteToken(user) {
+  return jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '1h' });
+}
+
+// "Tv Fizika'ga kirish" tugmasi uchun to'liq havola: sayt manziliga ?token=... qo'shib beradi.
+// Sayt (index.html) shu tokenni o'qib, /api/verify-token orqali tekshiradi va avtomatik login qiladi.
+function buildSiteLoginUrl(user) {
+  const base = APP_SITE_URL || 'https://tvfizika.uz';
+  const token = generateSiteToken(user);
+  return `${base}/?token=${token}`;
+}
+
 
 function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -160,7 +176,7 @@ bot.start(async (ctx) => {
               parse_mode: 'Markdown',
               reply_markup: {
                 inline_keyboard: [
-                  [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+                  [styledUrl('🎓 Tv Fizika\'ga kirish', buildSiteLoginUrl(existing), 'primary')],
                   [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
                 ],
               },
@@ -177,7 +193,7 @@ bot.start(async (ctx) => {
             parse_mode: 'Markdown',
             reply_markup: {
               inline_keyboard: [
-                [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+                [styledUrl('🎓 Tv Fizika\'ga kirish', buildSiteLoginUrl(existing), 'primary')],
                 [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
                 [styledCallback('👤 Profilim', 'PROFILE', 'success'), styledCallback('ℹ️ Yordam', 'HELP', 'danger')],
               ],
@@ -193,7 +209,7 @@ bot.start(async (ctx) => {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
-              [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+              [styledUrl('🎓 Tv Fizika\'ga kirish', buildSiteLoginUrl(existing), 'primary')],
               [styledCallback('🔑 6 xonali kodni olish', 'NEW_CODE', 'primary')],
               [styledCallback('👤 Profilim', 'PROFILE', 'success'), styledCallback('ℹ️ Yordam', 'HELP', 'danger')],
             ],
@@ -347,7 +363,7 @@ async function finishRegistration(ctx, session) {
             parse_mode: 'Markdown',
             reply_markup: {
               inline_keyboard: [
-                [styledUrl('🎓 Tv Fizika\'ga kirish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+                [styledUrl('🎓 Tv Fizika\'ga kirish', buildSiteLoginUrl(newUser), 'primary')],
                 [styledCallback('📚 Darslar', 'OPEN_LESSONS', 'primary')],
               ],
             },
@@ -591,12 +607,55 @@ app.get('/api/login-status/:token', async (req, res) => {
         id: user.id,
         ism: user.ism,
         telefon: user.telefon,
+        viloyat: user.viloyat,
+        tuman: user.tuman,
         telegramUsername: user.telegramUsername,
       },
     });
   } catch (e) {
     console.error('login-status xatoligi:', e.message);
     return res.status(500).json({ ok: false, error: "Server xatoligi" });
+  }
+});
+
+// Telegram xabaridagi "Tv Fizika'ga kirish" tugmasidagi ?token=... ni tekshiradi.
+// Bu JWT — 1 soat amal qiladi, faqat userId'ni o'zida saqlaydi.
+// Sayt (index.html) sahifa ochilganda shu endpointga so'rov yuborib, avtomatik login qiladi.
+app.get('/api/verify-token', async (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).json({ ok: false, error: "Token yuborilmadi" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findOne({ id: decoded.userId });
+
+    if (!user) {
+      return res.status(404).json({ ok: false, error: "Foydalanuvchi topilmadi" });
+    }
+
+    user.isLoggedIn = true;
+    user.lastLoginAt = Date.now();
+    await user.save();
+
+    return res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        ism: user.ism,
+        telefon: user.telefon,
+        viloyat: user.viloyat,
+        tuman: user.tuman,
+        telegramUsername: user.telegramUsername,
+      },
+    });
+  } catch (e) {
+    if (e.name === 'TokenExpiredError') {
+      return res.status(410).json({ ok: false, error: "Havola muddati tugagan. Botga qaytib, qaytadan urinib ko'ring." });
+    }
+    return res.status(401).json({ ok: false, error: "Havola noto'g'ri yoki buzilgan" });
   }
 });
 
@@ -633,7 +692,7 @@ app.post('/api/verify', verifyLimiter, async (req, res) => {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
-              [styledUrl('🌐 Saytga o\'tish', APP_SITE_URL || 'https://tvfizika.uz', 'primary')],
+              [styledUrl('🌐 Saytga o\'tish', buildSiteLoginUrl(user), 'primary')],
               [styledCallback('👤 Profilim', 'PROFILE', 'success')],
             ],
           },
