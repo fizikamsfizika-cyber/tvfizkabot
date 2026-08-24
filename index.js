@@ -571,7 +571,7 @@ function formatLessonText(lesson, index, total) {
   );
 }
 
-bot.action(/LESSON_(\d+)/, async (ctx) => {
+bot.action(/^LESSON_(\d+)$/, async (ctx) => {
   const requestedIndex = parseInt(ctx.match[1], 10);
   await ctx.answerCbQuery();
   const { total, index, lesson } = await getLessonByIndex(requestedIndex);
