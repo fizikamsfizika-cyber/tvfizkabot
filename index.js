@@ -9,6 +9,8 @@ const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const { Telegraf, Markup } = require('telegraf');
+const https = require('https');
+const http = require('http');
 
 // ---------- SOZLAMALAR ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;   // Render'da Environment Variable sifatida qo'shiladi
@@ -816,10 +818,6 @@ app.post('/api/verify', verifyLimiter, async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('Tv Fizika Telegram bot ishlayapti ✅');
-});
-
 // Sayt tomonidan "Chiqish" bosilganda chaqiriladi — { userId: "u_..." } yuboriladi
 app.post('/api/logout', async (req, res) => {
   const { userId } = req.body;
@@ -857,6 +855,37 @@ app.post('/api/logout', async (req, res) => {
   }
 });
 
+// ---------- RENDER'DA UXLAB QOLMASLIK UCHUN SELF-PING ----------
+// Render'ning bepul (Free) tarifida server ~15 daqiqa faolsizlikdan keyin
+// "uxlab qoladi". Buning oldini olish uchun server o'zi-o'ziga har 10 daqiqada
+// bir marta HTTP so'rov yuboradi ("/" health-check endpointiga).
+// Eslatma: bu faqat Render doim ishlab turgan holatda (kamida bitta so'rov kelib
+// turganda) foydali; agar server allaqachon butunlay to'xtab qolgan bo'lsa
+// (masalan, deploy xatosi tufayli), self-ping uni qayta ishga tushira olmaydi —
+// bunday holatda tashqi monitoring xizmati (UptimeRobot va h.k.) ham kerak.
+function startSelfPing() {
+  if (!APP_URL) {
+    console.warn('APP_URL berilmagan — self-ping ishga tushirilmadi.');
+    return;
+  }
+
+  const PING_INTERVAL_MS = 10 * 60 * 1000; // 10 daqiqa
+
+  setInterval(() => {
+    const client = APP_URL.startsWith('https') ? https : http;
+    client
+      .get(APP_URL, (res) => {
+        console.log(`Self-ping: ${res.statusCode} (${new Date().toLocaleTimeString('uz-UZ', { timeZone: 'Asia/Tashkent' })})`);
+        res.resume(); // javob tanasini iste'mol qilish (memory leak bo'lmasligi uchun)
+      })
+      .on('error', (e) => {
+        console.error('Self-ping xatoligi:', e.message);
+      });
+  }, PING_INTERVAL_MS);
+
+  console.log(`Self-ping yoqildi — har ${PING_INTERVAL_MS / 60000} daqiqada ${APP_URL} ga so'rov yuboriladi.`);
+}
+
 // ---------- SERVERNI ISHGA TUSHIRISH ----------
 app.listen(PORT, async () => {
   console.log(`Server ${PORT}-portda ishga tushdi`);
@@ -872,4 +901,6 @@ app.listen(PORT, async () => {
   } else {
     console.warn('APP_URL berilmagan — webhook o\'rnatilmadi.');
   }
+
+  startSelfPing();
 });
