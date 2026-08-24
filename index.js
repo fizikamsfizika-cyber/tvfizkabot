@@ -299,8 +299,7 @@ bot.on('text', async (ctx, next) => {
           );
         }
 
-        const count = await Lesson.countDocuments();
-        await Lesson.create({
+        const newLesson = await Lesson.create({
           title: adminSession.title,
           content: adminSession.content,
           youtubeId,
@@ -310,7 +309,14 @@ bot.on('text', async (ctx, next) => {
         return ctx.reply(
           "✅ Dars muvaffaqiyatli qo'shildi!" +
           (youtubeId ? " 🎬 Video ham biriktirildi." : "") +
-          "\n\n/darslar orqali ko'rishingiz mumkin."
+          "\n\n/darslar orqali ko'rishingiz mumkin.",
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [styledCallback('❌ Shu darsni o\'chirish', `DEL_LESSON_${newLesson._id}`, 'danger')],
+              ],
+            },
+          }
         );
       } catch (e) {
         console.error('dars_qoshish xatoligi:', e.message);
@@ -605,8 +611,77 @@ bot.command('darslar_royxati', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return ctx.reply("Bu buyruq faqat adminlar uchun.");
   const all = await Lesson.find().sort({ order: 1 });
   if (!all.length) return ctx.reply("Darslar ro'yxati bo'sh.");
-  const text = all.map((l, i) => `${i + 1}. ${l.title}${l.youtubeId ? ' 🎬' : ''}`).join('\n');
-  return ctx.reply(`📚 Darslar ro'yxati:\n\n${text}`);
+
+  return ctx.reply(
+    "📚 Darslar ro'yxati (o'chirish uchun tugmani bosing):",
+    {
+      reply_markup: {
+        inline_keyboard: all.map((l, i) => [
+          styledCallback(
+            `${i + 1}. ${l.title}${l.youtubeId ? ' 🎬' : ''} ❌`,
+            `DEL_LESSON_${l._id}`,
+            'danger'
+          ),
+        ]),
+      },
+    }
+  );
+});
+
+// Darsni o'chirish tugmasi bosilganda — avval tasdiqlash so'raladi
+bot.action(/^DEL_LESSON_(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return ctx.answerCbQuery("Bu amal faqat adminlar uchun.");
+  const lessonId = ctx.match[1];
+
+  try {
+    const lesson = await Lesson.findById(lessonId);
+    if (!lesson) {
+      await ctx.answerCbQuery("Dars topilmadi (allaqachon o'chirilgan bo'lishi mumkin).");
+      return ctx.deleteMessage().catch(() => {});
+    }
+
+    await ctx.answerCbQuery();
+    return ctx.editMessageText(
+      `❗ "${lesson.title}" darsini rostdan ham o'chirmoqchimisiz?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              styledCallback('✅ Ha, o\'chirish', `CONFIRM_DEL_${lesson._id}`, 'danger'),
+              styledCallback('↩️ Bekor qilish', 'CANCEL_DEL', 'primary'),
+            ],
+          ],
+        },
+      }
+    );
+  } catch (e) {
+    console.error('dars o\'chirish (so\'rov) xatoligi:', e.message);
+    return ctx.answerCbQuery("Xatolik yuz berdi.");
+  }
+});
+
+// Tasdiqlangandan keyin darsni bazadan butunlay o'chiradi
+bot.action(/^CONFIRM_DEL_(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return ctx.answerCbQuery("Bu amal faqat adminlar uchun.");
+  const lessonId = ctx.match[1];
+
+  try {
+    const lesson = await Lesson.findByIdAndDelete(lessonId);
+    await ctx.answerCbQuery("Dars o'chirildi.");
+    return ctx.editMessageText(
+      lesson
+        ? `🗑 "${lesson.title}" darsi o'chirildi.\n\n/darslar_royxati orqali qolgan darslarni ko'rishingiz mumkin.`
+        : "Dars allaqachon o'chirilgan edi."
+    );
+  } catch (e) {
+    console.error('dars o\'chirish xatoligi:', e.message);
+    return ctx.answerCbQuery("Xatolik yuz berdi, dars o'chirilmadi.");
+  }
+});
+
+bot.action('CANCEL_DEL', async (ctx) => {
+  await ctx.answerCbQuery("Bekor qilindi.");
+  return ctx.editMessageText("Amal bekor qilindi. /darslar_royxati orqali qayta ko'rishingiz mumkin.");
 });
 
 // ---------- WEBHOOK O'RNATISH (Render uchun) ----------
