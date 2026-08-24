@@ -82,10 +82,30 @@ function generateLoginToken() {
 const lessonSchema = new mongoose.Schema({
   title: { type: String, required: true },
   content: { type: String, default: '' },
+  youtubeId: { type: String, default: null }, // faqat YouTube video ID (masalan: dQw4w9WgXcQ)
   order: { type: Number, required: true, index: true },
   createdAt: { type: Number, default: () => Date.now() },
 });
 const Lesson = mongoose.model('Lesson', lessonSchema);
+
+// Har xil ko'rinishdagi YouTube linklardan (youtu.be, watch?v=, shorts, embed) video ID'ni ajratib oladi.
+// Agar link noto'g'ri bo'lsa yoki umuman link bo'lmasa (masalan "-" yozilsa) — null qaytaradi.
+function extractYoutubeId(input) {
+  if (!input) return null;
+  const text = input.trim();
+  if (text === '-' || text.toLowerCase() === 'yoq' || text.toLowerCase() === "yo'q") return null;
+
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtube\.com\/embed\/|youtube\.com\/shorts\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+    /^([a-zA-Z0-9_-]{11})$/, // to'g'ridan-to'g'ri video ID kiritilgan bo'lsa
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
 
 // Admin chatId'lari — vergul bilan ajratilgan holda .env ga qo'shiladi: ADMIN_IDS=123456,789012
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
@@ -244,15 +264,37 @@ bot.on('text', async (ctx) => {
       return ctx.reply("Endi dars matnini (tavsifini) kiriting:");
     }
     if (adminSession.step === 'content') {
+      adminSession.content = text;
+      adminSession.step = 'video';
+      return ctx.reply(
+        "Endi darsning YouTube havolasini yuboring.\n\n" +
+        "Masalan: https://youtu.be/dQw4w9WgXcQ\n" +
+        "yoki: https://www.youtube.com/watch?v=dQw4w9WgXcQ\n\n" +
+        "Agar bu darsda video bo'lmasa — \"-\" belgisini yuboring."
+      );
+    }
+    if (adminSession.step === 'video') {
       try {
+        const youtubeId = extractYoutubeId(text);
+        if (text.trim() !== '-' && !youtubeId) {
+          return ctx.reply(
+            "❌ Bu YouTube havolasi tanilmadi. Iltimos, to'g'ri linkni yuboring yoki video yo'q bo'lsa \"-\" yozing."
+          );
+        }
+
         const count = await Lesson.countDocuments();
         await Lesson.create({
           title: adminSession.title,
-          content: text,
+          content: adminSession.content,
+          youtubeId,
           order: count,
         });
         delete adminSessions[chatId];
-        return ctx.reply("✅ Dars muvaffaqiyatli qo'shildi! /darslar orqali ko'rishingiz mumkin.");
+        return ctx.reply(
+          "✅ Dars muvaffaqiyatli qo'shildi!" +
+          (youtubeId ? " 🎬 Video ham biriktirildi." : "") +
+          "\n\n/darslar orqali ko'rishingiz mumkin."
+        );
       } catch (e) {
         console.error('dars_qoshish xatoligi:', e.message);
         delete adminSessions[chatId];
@@ -453,7 +495,7 @@ bot.action('OPEN_LESSONS', async (ctx) => {
   if (!lesson) return ctx.reply("Hozircha darslar qo'shilmagan.");
   return ctx.reply(formatLessonText(lesson, index, total), {
     parse_mode: 'Markdown',
-    reply_markup: lessonsKeyboard(index, total),
+    reply_markup: lessonsKeyboard(index, total, lesson),
   });
 });
 
@@ -479,7 +521,13 @@ async function getLessonByIndex(index) {
   return { total, index: safeIndex, lesson };
 }
 
-function lessonsKeyboard(index, total) {
+function lessonsKeyboard(index, total, lesson) {
+  const rows = [];
+
+  if (lesson && lesson.youtubeId) {
+    rows.push([styledUrl('▶️ Videoni ko\'rish', `https://youtu.be/${lesson.youtubeId}`, 'danger')]);
+  }
+
   const navRow = [];
   if (index > 0) {
     navRow.push(styledCallback('⬅️ Oldingisi', `LESSON_${index - 1}`, 'primary'));
@@ -487,15 +535,15 @@ function lessonsKeyboard(index, total) {
   if (index < total - 1) {
     navRow.push(styledCallback('Keyingisi ➡️', `LESSON_${index + 1}`, 'primary'));
   }
-  const rows = [];
   if (navRow.length) rows.push(navRow);
+
   return { inline_keyboard: rows };
 }
 
 function formatLessonText(lesson, index, total) {
   return (
     `📘 *${lesson.title}*\n` +
-    `_(${index + 1}/${total})_\n\n` +
+    `_(${index + 1}/${total})_${lesson.youtubeId ? ' 🎬' : ''}\n\n` +
     (lesson.content ? lesson.content : '_Matn hali qo\'shilmagan._')
   );
 }
@@ -507,7 +555,7 @@ bot.action(/LESSON_(\d+)/, async (ctx) => {
   if (!lesson) return ctx.reply('Hozircha darslar mavjud emas.');
   return ctx.editMessageText(formatLessonText(lesson, index, total), {
     parse_mode: 'Markdown',
-    reply_markup: lessonsKeyboard(index, total),
+    reply_markup: lessonsKeyboard(index, total, lesson),
   });
 });
 
@@ -521,7 +569,7 @@ bot.command('darslar', async (ctx) => {
   }
   return ctx.reply(formatLessonText(lesson, index, total), {
     parse_mode: 'Markdown',
-    reply_markup: lessonsKeyboard(index, total),
+    reply_markup: lessonsKeyboard(index, total, lesson),
   });
 });
 
@@ -540,7 +588,7 @@ bot.command('darslar_royxati', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return ctx.reply("Bu buyruq faqat adminlar uchun.");
   const all = await Lesson.find().sort({ order: 1 });
   if (!all.length) return ctx.reply("Darslar ro'yxati bo'sh.");
-  const text = all.map((l, i) => `${i + 1}. ${l.title}`).join('\n');
+  const text = all.map((l, i) => `${i + 1}. ${l.title}${l.youtubeId ? ' 🎬' : ''}`).join('\n');
   return ctx.reply(`📚 Darslar ro'yxati:\n\n${text}`);
 });
 
@@ -656,6 +704,49 @@ app.get('/api/verify-token', async (req, res) => {
       return res.status(410).json({ ok: false, error: "Havola muddati tugagan. Botga qaytib, qaytadan urinib ko'ring." });
     }
     return res.status(401).json({ ok: false, error: "Havola noto'g'ri yoki buzilgan" });
+  }
+});
+
+// ---------- KABINETIM: DARSLAR API (sayt frontend uchun) ----------
+
+// Barcha darslar ro'yxati (kabinet.html'dagi Darslar sahifasi shu ro'yxatni ko'rsatadi)
+app.get('/api/lessons', async (req, res) => {
+  try {
+    const lessons = await Lesson.find().sort({ order: 1 });
+    return res.json({
+      ok: true,
+      lessons: lessons.map((l) => ({
+        id: l._id,
+        title: l.title,
+        order: l.order,
+        hasVideo: Boolean(l.youtubeId),
+      })),
+    });
+  } catch (e) {
+    console.error('lessons ro\'yxati xatoligi:', e.message);
+    return res.status(500).json({ ok: false, error: "Server xatoligi" });
+  }
+});
+
+// Bitta darsning to'liq ma'lumoti (video ID bilan) — kabinet.html shu orqali YouTube playerni ochadi
+app.get('/api/lessons/:id', async (req, res) => {
+  try {
+    const lesson = await Lesson.findById(req.params.id);
+    if (!lesson) return res.status(404).json({ ok: false, error: "Dars topilmadi" });
+
+    return res.json({
+      ok: true,
+      lesson: {
+        id: lesson._id,
+        title: lesson.title,
+        content: lesson.content,
+        youtubeId: lesson.youtubeId,
+        order: lesson.order,
+      },
+    });
+  } catch (e) {
+    console.error('lesson olish xatoligi:', e.message);
+    return res.status(500).json({ ok: false, error: "Server xatoligi yoki noto'g'ri ID" });
   }
 });
 
