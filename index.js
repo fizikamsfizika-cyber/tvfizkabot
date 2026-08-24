@@ -36,6 +36,13 @@ app.use(express.json());
 // CORS — faqat kerakli domenga ruxsat berish tavsiya etiladi
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 
+// Yengil health-check endpoint — tashqi "uptime monitor" xizmatlari (masalan UptimeRobot)
+// shu manzilga muntazam so'rov yuborib, Render'ning bepul tarifida server "uxlab qolishining"
+// oldini oladi. Bazaga murojaat qilmaydi, shuning uchun tez javob qaytaradi.
+app.get('/', (req, res) => {
+  res.status(200).send('OK — Tv Fizika bot ishlamoqda');
+});
+
 // ---------- MONGODB ULANISH ----------
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('MongoDB ga muvaffaqiyatli ulandi'))
