@@ -260,9 +260,17 @@ bot.start(async (ctx) => {
   }
 });
 
-bot.on('text', async (ctx) => {
+bot.on('text', async (ctx, next) => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text.trim();
+
+  // Agar xabar biror buyruq bo'lsa (masalan /dars_qoshish, /darslar, /start)
+  // va hozircha faol admin yoki register sessiyasi bo'lmasa — uni shu yerda
+  // "ushlab qolmasdan", tegishli bot.command() handleriga o'tkazib yuboramiz.
+  const isCommand = text.startsWith('/');
+  if (isCommand && !adminSessions[chatId] && !sessions[chatId]) {
+    return next();
+  }
 
   // Admin: dars qo'shish jarayoni
   const adminSession = adminSessions[chatId];
