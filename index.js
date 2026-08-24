@@ -299,6 +299,7 @@ bot.on('text', async (ctx, next) => {
           );
         }
 
+        const count = await Lesson.countDocuments();
         const newLesson = await Lesson.create({
           title: adminSession.title,
           content: adminSession.content,
